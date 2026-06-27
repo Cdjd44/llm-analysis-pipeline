@@ -1,87 +1,96 @@
-# llm-analysis-pipeline
+# LLM Analysis Pipeline
 
-A production-pattern pipeline for running structured LLM analysis via the Anthropic API. Built to demonstrate the full operational story: secure key handling, prompt versioning, automated evals, and per-call cost observability.
+A small, deliberately focused LLM application built to demonstrate the *operational* layers that separate a production-minded LLM system from a one-off API call. It analyses a stock position and returns a structured `signal` / `score` / `reason`, but the domain is incidental — the point is the scaffolding around the model call.
 
----
+The whole thing is intentionally tight so that every operational layer is legible in a few minutes of reading:
+
+- **A backend proxy** that holds the API key server-side, so it never reaches the browser.
+- **Versioned prompts** kept as configuration files rather than buried string literals.
+- **Token-cost accounting** that prices every call from the model's reported usage.
+- **An eval harness** with schema, plausibility, and numeric-consistency (hallucination) checks, **wired into CI** so an output regression turns the build red.
+
+> Demonstration project, not financial advice. The analysis output is a vehicle for showing the engineering; it is not a basis for real trading decisions, and the model has no market data beyond the single position passed to it.
 
 ## Architecture
 
 ```
-┌─────────────────┐        ┌──────────────────┐        ┌─────────────────┐
-│   client/       │  HTTP  │   proxy/          │  SDK   │  Anthropic API  │
-│   index.html    │───────▶│   index.js        │───────▶│  claude-*       │
-│                 │◀───────│   (Azure Fn)      │◀───────│                 │
-│  no API key     │  JSON  │   holds the key   │  usage │                 │
-└─────────────────┘        └────────┬─────────┘        └─────────────────┘
-                                    │
-                         ┌──────────┴──────────┐
-                         │  observability/     │
-                         │  costLogger.js      │
-                         │  (tokens + $)       │
-                         └─────────────────────┘
+Browser / CLI ──POST──> Backend Proxy ──────> Anthropic API
+  (holds no key)         (Azure Function)        │
+                              │                   │
+                              ├─ prompts/        (versioned prompt config)
+                              ├─ pipeline        (load → call → validate → cost)
+                              ├─ costLogger      (usage → USD, per call)
+                              └─ structured-output validation
+
+evals/  ── imports the SAME pipeline ──> runs a curated dataset through it,
+                                          scores the output, fails CI on regression
 ```
 
-**Key design decisions:**
+The single most important design decision is that the **model client, prompt config, and cost logger are injected** into one shared pipeline module. The proxy builds that pipeline with the live Anthropic client; the eval harness builds it with a fixture-backed client. So the code exercised by the tests is the same code that ships, not a parallel reimplementation.
 
-- **Proxy holds the key.** The client never touches the Anthropic key. The proxy is the only trust boundary between user input and the API.
-- **Prompts are config, not code.** `prompts/` holds versioned JSON files. Swapping prompt versions requires no code change — just a config update.
-- **Evals are first-class.** The `evals/` layer runs on every push via GitHub Actions. This is what separates a demo from a production system.
-- **Observability from day one.** Every API call logs token usage and estimated cost. You know what the pipeline costs before it surprises you.
+The second decision worth calling out: **evals run in two modes**. Every-push CI uses recorded fixtures — deterministic, free, no key required. A separate, deliberate job (not on every commit) runs against the live model to catch genuine drift. Conflating "test my pipeline logic" with "test the live model" is a common mistake; they are kept apart on purpose.
 
----
+## Why this structure
 
-## Operational Story
+This project started life as a single-file browser dashboard that called the model API directly from client-side JavaScript. That approach has one unfixable flaw: any key in front-end code is exposed, because the browser must be able to read it. The rebuild exists to do it correctly — the proxy pattern is the fix, and once there is a server-side component, every operational layer finally has somewhere to live. None of them are possible in a pure client-side file.
 
-### Local development
+## Layout
+
+```
+.
+├── proxy/
+│   ├── index.js          Azure Function HTTP trigger — the proxy, holds the key
+│   ├── pipeline.js       core loop, shared by proxy + evals (dependency-injected)
+│   └── anthropicClient.js  the Anthropic call; surfaces the usage object
+├── prompts/
+│   └── analysis.v1.json  prompt-as-config; bump the version to roll forward
+├── observability/
+│   └── costLogger.js     token → USD accounting per call
+├── evals/
+│   ├── dataset.json      curated scenarios with expected bounds
+│   ├── scorers.js        schema, plausibility, numeric-consistency checks
+│   ├── runEvals.js       runs the dataset through the pipeline; non-zero on fail
+│   └── fixtures/         recorded model outputs for deterministic CI
+├── client/
+│   └── index.html        deliberately thin demo client — holds no key
+└── .github/workflows/
+    └── evals.yml         runs the eval harness on every push
+```
+
+## Running it
+
+**Evals (no key needed — this is the interesting part):**
 
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Copy env template and fill in your key
-cp .env.example .env
-
-# 3. Start the proxy (Azure Functions local runtime)
-cd proxy && func start
-
-# 4. Open the client
-open client/index.html
+npm run eval
 ```
 
-### Running evals locally
+This runs every scenario through the pipeline against recorded fixtures and scores the output. One fixture carries a deliberately planted inconsistency — the model's prose cites a percentage that matches neither the true profit/loss nor the day's move — to demonstrate the consistency scorer catching an unfaithful figure and failing the run.
+
+**Evals against the live model (drift detection):**
 
 ```bash
-node evals/runEvals.js
+cp .env.example .env      # then add a real ANTHROPIC_API_KEY
+npm run eval:live
 ```
 
-Evals score model output against `evals/dataset.json`. Each scenario defines expected bounds (tone, length, required terms). A passing run prints a score ≥ the threshold defined in `runEvals.js`.
+**The proxy locally** (requires the Azure Functions Core Tools):
 
-### CI
+```bash
+npm start                 # serves the analyze endpoint on :7071
+```
 
-Every push triggers `.github/workflows/evals.yml`, which runs the full eval suite against the current prompt version. A failing eval blocks merge — this is intentional.
+Then open `client/index.html` and point `PROXY_URL` at the local endpoint.
 
----
+## The eval checks, briefly
 
-## Prompt versioning
+1. **Schema** — is the output valid JSON, with `signal` in the allowed set and `score` an integer in range? Malformed output is a first-class failure, never silently coerced.
+2. **Plausibility** — does the signal/score fall inside loose, per-scenario bounds? These are intentionally wide; there is no single correct answer, so this catches gross errors, not opinions.
+3. **Consistency** — the most interesting check. It extracts percentages from the model's prose and reconciles them against the figures actually provided. A number that matches nothing is flagged as a likely hallucination.
 
-`prompts/analysis.v1.json` is the baseline. `prompts/analysis.v2.json` introduces chain-of-thought scaffolding. The proxy loads the version specified by `PROMPT_VERSION` in `.env`. To A/B test, deploy two instances with different env values.
+The consistency scorer is a smoke detector, not a proof: it reads figures from free text with a regex, so it misses values phrased in words and can occasionally flag a legitimately different number. That limitation is documented in the code, because understanding where a scorer is blind is part of using it responsibly.
 
----
+## Secret handling
 
-## Cost model
-
-`observability/costLogger.js` reads `input_tokens` and `output_tokens` from the Anthropic response and applies the published per-token rates. Logs go to stdout in structured JSON so they can be forwarded to any log aggregator.
-
----
-
-## Directory reference
-
-| Path | Purpose |
-|---|---|
-| `proxy/` | Azure HTTP Function — the only process that holds the API key |
-| `proxy/anthropicClient.js` | Thin wrapper around the Anthropic SDK; extracts usage |
-| `prompts/` | Versioned prompt configs loaded at call time |
-| `evals/` | Dataset + runner + scorers; CI-enforced quality gate |
-| `observability/` | Per-call token and cost logging |
-| `client/` | Minimal HTML UI; calls proxy, never the API directly |
-| `.github/workflows/` | Eval CI — the standout operational piece |
+API keys are read from the environment (`.env` locally — gitignored; Application Settings or Key Vault in Azure) and never committed. `.env.example` lists variable names with placeholder values only. The browser client holds no model key at any point.
