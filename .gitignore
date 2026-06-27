@@ -315,6 +315,9 @@ FakesAssemblies/
 .ntvs_analysis.dat
 node_modules/
 
+# Azure Functions local config (holds connection strings + keys)
+local.settings.json
+
 # Visual Studio 6 build log
 *.plg
 
